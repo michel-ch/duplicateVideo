@@ -10,6 +10,12 @@ backend/.env
 backend/duplicate_detector.db
 backend/thumbnails/
 
+# Docker-compose runtime volumes (./data and ./thumbnails are bind-mounted
+# in docker-compose.yml — they hold the SQLite DB and generated thumbnails
+# at the repo root and must never be committed)
+/data/
+/thumbnails/
+
 # Node / Frontend
 frontend/node_modules/
 frontend/dist/

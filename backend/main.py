@@ -19,17 +19,54 @@ class _QuietPollFilter(logging.Filter):
 
 logging.getLogger("uvicorn.access").addFilter(_QuietPollFilter())
 
-from models.database import init_db
+from datetime import datetime, timezone
+from sqlalchemy import select
+
+from models.database import init_db, async_session, ScanJob
 from api.scan import router as scan_router
 from api.duplicates import router as duplicates_router
 from api.actions import router as actions_router
 from services.gpu_detector import detect_gpu, get_gpu_info
 
 
+_ORPHAN_ACTIVE_STATUSES = (
+    "pending", "scanning", "metadata", "hashing", "comparing", "paused",
+)
+
+
+async def _recover_orphaned_scans() -> None:
+    """Mark scans that were active when the server died as 'stopped'.
+
+    On a clean shutdown via /stop or the user clicking through the UI,
+    scans transition into a terminal state cleanly.  But if the process
+    was killed (Ctrl-C, OOM, power loss), any scan still in an active
+    state has no running pipeline behind it — the FileCache rows it
+    committed are intact, but the ScanJob row itself looks alive forever.
+    Flip these to 'stopped' so the UI doesn't show a fake spinner and
+    so new scans can leave the 'queued' state.
+    """
+    async with async_session() as db:
+        result = await db.execute(
+            select(ScanJob).where(ScanJob.status.in_(_ORPHAN_ACTIVE_STATUSES))
+        )
+        orphans = result.scalars().all()
+        if not orphans:
+            return
+        now = datetime.now(timezone.utc)
+        for s in orphans:
+            s.status = "stopped"
+            s.completed_at = now
+            s.current_stage = "Server restarted while scan was in progress"
+            s.current_file = None
+        await db.commit()
+        print(f"[STARTUP] Recovered {len(orphans)} orphaned scan(s) → stopped")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize database and probe GPU on startup."""
     await init_db()
+    await _recover_orphaned_scans()
     # Eagerly detect GPU capabilities so the first scan doesn't pay the cost
     gpu = detect_gpu()
     if gpu.available:
@@ -68,9 +105,28 @@ os.makedirs(thumbnails_dir, exist_ok=True)
 app.mount("/thumbnails", StaticFiles(directory=thumbnails_dir), name="thumbnails")
 
 
-@app.get("/")
-async def root():
-    return {"message": "Duplicate Video Detector API", "version": "1.0.0"}
+# Serve frontend static files (production build)
+frontend_dist = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
+if os.path.isdir(frontend_dist):
+    app.mount("/assets", StaticFiles(directory=os.path.join(frontend_dist, "assets")), name="frontend-assets")
+
+    from fastapi.responses import FileResponse
+
+    @app.get("/")
+    async def serve_frontend():
+        return FileResponse(os.path.join(frontend_dist, "index.html"))
+
+    @app.get("/{full_path:path}")
+    async def serve_frontend_fallback(full_path: str):
+        """SPA fallback - serve index.html for client-side routes."""
+        file_path = os.path.join(frontend_dist, full_path)
+        if os.path.isfile(file_path):
+            return FileResponse(file_path)
+        return FileResponse(os.path.join(frontend_dist, "index.html"))
+else:
+    @app.get("/")
+    async def root():
+        return {"message": "Duplicate Video Detector API", "version": "1.0.0"}
 
 
 @app.get("/api/gpu-status")

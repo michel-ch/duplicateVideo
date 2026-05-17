@@ -8,7 +8,7 @@ from datetime import datetime
 # ---- Scan ----
 
 class ScanOptions(BaseModel):
-    similarity_threshold: float = 85.0
+    similarity_threshold: float = 70.0
     duration_tolerance: float = 2.0
     key_frames_count: int = 8
     hash_threshold: int = 10

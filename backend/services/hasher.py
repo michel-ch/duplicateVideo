@@ -34,6 +34,15 @@ except ImportError:
 from config import settings
 from services.gpu_detector import get_gpu_info
 
+# Bump whenever the pHash extraction OUTPUT changes in a way that makes old
+# cached hashes incomparable with new ones (e.g. new preprocessing filter).
+# Cache rows with `cache_version < PHASH_VERSION` have their `perceptual_hashes`
+# re-extracted on the next scan.
+#   v1 = uniform-12 frames, no letterbox stripping
+#   v3 = uniform-12 frames + letterbox stripping (this revision)
+# (v2 is reserved for AUDIO_FP_VERSION bump in audio_fingerprint.py)
+PHASH_VERSION = 3
+
 # Shared thread pool — GPU can handle many decode streams concurrently
 _executor = ThreadPoolExecutor(max_workers=settings.MAX_CONCURRENT_FFMPEG * 3)
 
@@ -256,6 +265,97 @@ def _build_frame_extract_cmd(
     return cmd
 
 
+def _build_single_frame_cmd(
+    file_path: str,
+    timestamp: float,
+    output_path: str,
+    video_info: Optional[dict] = None,
+) -> List[str]:
+    """ffmpeg cmd to grab ONE frame at `timestamp` via fast container seek.
+
+    `-ss` placed BEFORE `-i` is a fast container-level seek: ffmpeg jumps
+    to the keyframe at-or-before `timestamp` then decodes forward to the
+    nearest frame.  Reads only ~1 s of bitstream regardless of total
+    video length — drastically faster than the `fps=N/duration` filter
+    chain on long files.
+
+    CPU decode only.  Spawning N CUDA contexts per video to decode <1 s
+    of bitstream each isn't worth the per-context init cost.
+    """
+    vinfo = video_info if video_info else _get_video_info(file_path)
+    is_portrait = _is_display_portrait(vinfo)
+    has_sar = _has_non_square_sar(vinfo)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{timestamp:.3f}",
+        "-i", str(file_path),
+        "-frames:v", "1",
+    ]
+    filters: List[str] = []
+    if has_sar:
+        filters.append("scale=iw*sar:ih")
+        filters.append("setsar=1")
+    if is_portrait:
+        filters.append("transpose=1")
+    filters.append("scale=320:-2")
+    cmd += ["-vf", ",".join(filters), "-q:v", "2", output_path]
+    return cmd
+
+
+def _extract_frames_seek_sync(
+    file_path: str,
+    num_frames: int,
+    output_dir: str,
+    duration: float,
+    video_info: Optional[dict] = None,
+) -> List[str]:
+    """Extract N evenly-spaced frames via N parallel fast-seek calls.
+
+    Per-frame wall-clock cost is roughly constant in video length, so a
+    36-min file extracts in ~the same time as a 5-min file (network/decode
+    latency dominates, both are small).  Wall-clock per video ≈
+    `ceil(num_frames / inner_workers) × per_frame_latency`.
+    """
+    margin = duration * 0.02  # skip the first/last 2% (intros, credits)
+    usable = max(duration - 2 * margin, 0.0)
+    if usable <= 0:
+        return []
+    timestamps = [margin + usable * (i + 0.5) / num_frames for i in range(num_frames)]
+
+    output_paths = [
+        os.path.join(output_dir, f"frame_{i+1:04d}.jpg")
+        for i in range(num_frames)
+    ]
+
+    # Inner pool stays small — the outer scan pipeline already has 8-12
+    # videos in flight.  4 × 12 = 48 concurrent ffmpeg subprocesses is the
+    # upper bound on this path, which Windows handles fine.
+    inner_workers = min(4, num_frames)
+    # Each call is small (one keyframe + a handful of decode steps), but
+    # network latency on slow SMB can push it well above 10 s.
+    per_frame_timeout = 60
+
+    def _extract_one(args):
+        ts, out_path = args
+        cmd = _build_single_frame_cmd(file_path, ts, out_path, video_info)
+        try:
+            subprocess.run(
+                cmd, capture_output=True, timeout=per_frame_timeout,
+                creationflags=_CREATION_FLAGS,
+            )
+        except Exception:
+            return None
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            return out_path
+        return None
+
+    with ThreadPoolExecutor(max_workers=inner_workers) as pool:
+        results = list(pool.map(_extract_one, zip(timestamps, output_paths)))
+
+    return [p for p in results if p is not None]
+
+
 def _extract_frames_sync(
     file_path: str,
     num_frames: int = 8,
@@ -265,9 +365,17 @@ def _extract_frames_sync(
     video_info: Optional[dict] = None,
 ) -> List[str]:
     """
-    Extract N evenly spaced frames using a SINGLE FFmpeg call.
-    Uses GPU decoding when available.  All frames are normalised
-    (SAR applied, portrait rotated to landscape) for consistent hashing.
+    Extract N evenly spaced frames.
+
+    For videos shorter than ~1 min, uses a single GPU-accelerated ffmpeg
+    call with the `fps=N/duration` filter (full decode is fast at that
+    length).  For longer videos, switches to N parallel `-ss` fast-seek
+    calls — total wall-clock then scales with `num_frames`, not `duration`,
+    which is the only thing that fits the 60 s timeout for 2-3 min HEVC
+    files over a network share.
+
+    All frames are normalised (SAR applied, portrait rotated to landscape,
+    scaled to width 320) for consistent hashing.
 
     If `duration`, `codec`, and `video_info` are provided (from a prior
     metadata pass), all extra ffprobe calls are skipped entirely.
@@ -283,6 +391,19 @@ def _extract_frames_sync(
 
     if codec is None:
         codec = _get_video_codec(file_path)
+
+    # Anything past 1 min: per-frame fast-seek.  The `fps=N/duration`
+    # filter forces a full sequential decode, which on HEVC over SMB
+    # blows past the 60 s timeout floor for files as short as ~2 min.
+    if duration >= 60:
+        seek_frames = _extract_frames_seek_sync(
+            file_path, num_frames, output_dir, duration, video_info,
+        )
+        if seek_frames:
+            return seek_frames
+        # Fall through to single-pass on total failure (e.g. exotic codec
+        # whose container seek doesn't land on a usable keyframe).
+
     output_pattern = os.path.join(output_dir, "frame_%04d.jpg")
 
     cmd = _build_frame_extract_cmd(
@@ -290,11 +411,18 @@ def _extract_frames_sync(
         video_info=video_info,
     )
 
+    # The `fps=N/duration` filter forces ffmpeg to decode the FULL stream to
+    # emit N evenly-spaced frames.  On a long HEVC file over a slow network
+    # share, that's minutes of work — the original 60 s timeout reliably
+    # killed a 36-min HEVC over SMB.  Scale by duration with a 60 s floor
+    # and a 15 min ceiling (the proper fix is I-frame seeking — deferred).
+    extract_timeout = max(60, min(900, int(duration * 0.3)))
+
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
-            timeout=60,
+            timeout=extract_timeout,
             creationflags=_CREATION_FLAGS,
         )
 
@@ -315,7 +443,7 @@ def _extract_frames_sync(
                 subprocess.run(
                     cpu_cmd,
                     capture_output=True,
-                    timeout=60,
+                    timeout=extract_timeout,
                     creationflags=_CREATION_FLAGS,
                 )
                 for i in range(1, num_frames + 1):
@@ -332,6 +460,41 @@ def _extract_frames_sync(
 
 # ── Perceptual hashing ────────────────────────────────────────────────────────
 
+def _strip_letterbox(img: "Image.Image", dark_threshold: int = 24) -> "Image.Image":
+    """Crop uniform dark borders (letterbox/pillarbox) from a frame.
+
+    Two encodes of the same source where one is letterboxed (e.g. 2.35:1
+    pillarboxed into 16:9) and the other isn't would otherwise produce
+    different pHashes because the black bars dominate the DCT low
+    frequencies.  This runs in numpy on the already-extracted 320-wide
+    JPEG so the cost is ~1 ms per frame.
+
+    Only crops if at least 5% of either dimension is removed — avoids
+    cropping single-pixel dark scanlines that are part of the content.
+    """
+    try:
+        gray = np.asarray(img.convert("L"))
+        mask = gray > dark_threshold
+        if not mask.any():
+            return img
+        rows = mask.any(axis=1)
+        cols = mask.any(axis=0)
+        top = int(rows.argmax())
+        bottom = int(mask.shape[0] - rows[::-1].argmax())
+        left = int(cols.argmax())
+        right = int(mask.shape[1] - cols[::-1].argmax())
+        h, w = mask.shape
+        if right <= left or bottom <= top:
+            return img
+        cropped_h_pct = (top + (h - bottom)) / h
+        cropped_w_pct = (left + (w - right)) / w
+        if cropped_h_pct > 0.05 or cropped_w_pct > 0.05:
+            return img.crop((left, top, right, bottom))
+    except Exception:
+        pass
+    return img
+
+
 def _compute_hashes_sync(frame_paths: List[str]) -> List[str]:
     """Compute perceptual hashes for a list of frame images."""
     if not HAS_IMAGEHASH:
@@ -341,6 +504,7 @@ def _compute_hashes_sync(frame_paths: List[str]) -> List[str]:
     for fp in frame_paths:
         try:
             img = Image.open(fp)
+            img = _strip_letterbox(img)
             h = imagehash.phash(img, hash_size=16)
             hashes.append(str(h))
         except Exception:
@@ -488,6 +652,37 @@ def _hex_to_bits(hex_str: str) -> Optional[np.ndarray]:
         return np.unpackbits(np.frombuffer(byte_arr, dtype=np.uint8))
     except Exception:
         return None
+
+
+def compute_aggregate_hash(hashes: List[str]) -> Optional[str]:
+    """Reduce a list of frame pHashes to a single per-bit-majority hash.
+
+    For every bit position across the input hashes, the output bit is 1 iff
+    a majority of the inputs have that bit set.  This produces a single
+    256-bit (= 64 hex chars at hash_size=16) fingerprint that can be used
+    as the screening key in a binary nearest-neighbour index.  The full
+    12-hash set is still compared as a verifier on any shortlist.
+
+    Returns hex string, or None if the input is unusable.
+    """
+    if not hashes:
+        return None
+    bit_arrays = [b for b in (_hex_to_bits(h) for h in hashes) if b is not None]
+    if not bit_arrays:
+        return None
+    lengths = {len(b) for b in bit_arrays}
+    if len(lengths) > 1:
+        # Mixed hash sizes — drop ones that don't match the majority length
+        from collections import Counter
+        common_len, _ = Counter(len(b) for b in bit_arrays).most_common(1)[0]
+        bit_arrays = [b for b in bit_arrays if len(b) == common_len]
+        if not bit_arrays:
+            return None
+    stacked = np.stack(bit_arrays, axis=0)  # (n_hashes, n_bits)
+    threshold = stacked.shape[0] / 2.0
+    majority = (stacked.sum(axis=0) > threshold).astype(np.uint8)
+    packed = np.packbits(majority)
+    return packed.tobytes().hex()
 
 
 def compute_hamming_distance(hash1: str, hash2: str) -> int:

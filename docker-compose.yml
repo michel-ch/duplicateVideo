@@ -1,0 +1,30 @@
+services:
+  duplicate-video:
+    build: .
+    container_name: duplicate-video-detector
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - DATABASE_URL=sqlite+aiosqlite:///./data/duplicate_detector.db
+    volumes:
+      - ./data:/app/backend/data
+      - ./thumbnails:/app/backend/thumbnails
+      # Mount your media directories here (read-only recommended)
+      # - /path/to/your/videos:/media:ro
+    ports:
+      - "9000:9000"
+    restart: unless-stopped
+    runtime: nvidia
+    devices:
+      - /dev/nvidia0:/dev/nvidia0
+      - /dev/nvidiactl:/dev/nvidiactl
+      - /dev/nvidia-modeset:/dev/nvidia-modeset
+      - /dev/nvidia-uvm:/dev/nvidia-uvm
+      - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

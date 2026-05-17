@@ -2,7 +2,7 @@
 
 from sqlalchemy import (
     Column, Integer, String, Float, Boolean, DateTime, Text, ForeignKey,
-    UniqueConstraint, create_engine, event
+    UniqueConstraint, Index, create_engine, event
 )
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base, relationship
@@ -19,6 +19,40 @@ async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_migrate_add_columns)
+
+
+def _migrate_add_columns(conn) -> None:
+    """SQLite-only forward-only column adds.
+
+    `create_all` only creates missing TABLES, not missing columns on
+    existing tables.  When the schema gains a new nullable column, this
+    helper does a one-shot `ALTER TABLE ADD COLUMN` so users on a pre-
+    existing DB don't have to delete it.  Run on every startup; the
+    PRAGMA check makes it idempotent.
+    """
+    from sqlalchemy import text
+
+    def _existing_cols(table: str) -> set:
+        rows = conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()
+        return {r[1] for r in rows}
+
+    required: dict = {
+        "file_cache": {
+            "head_tail_xxh3": "VARCHAR",
+            "aggregate_hash": "VARCHAR",
+        },
+    }
+    for table, cols in required.items():
+        try:
+            existing = _existing_cols(table)
+        except Exception:
+            continue  # table doesn't exist yet — create_all will handle it
+        for col_name, col_type in cols.items():
+            if col_name not in existing:
+                conn.exec_driver_sql(
+                    f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}"
+                )
 
 
 async def get_db():
@@ -93,6 +127,10 @@ class VideoFile(Base):
     deleted_at = Column(DateTime, nullable=True)
     trash_path = Column(String, nullable=True)
 
+    # Cache linkage (Phase 1 incremental scans)
+    file_cache_id = Column(Integer, ForeignKey("file_cache.id"), nullable=True)
+    cache_hit = Column(Boolean, default=False)
+
     scan_job = relationship("ScanJob", back_populates="videos")
     duplicate_group = relationship("DuplicateGroup", back_populates="videos")
 
@@ -110,6 +148,70 @@ class DuplicateGroup(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     videos = relationship("VideoFile", back_populates="duplicate_group")
+
+
+class FileCache(Base):
+    """Persistent per-file cache of pipeline outputs, keyed by content identity.
+
+    A cache row's identity is (file_path, file_size, mtime_ns).  When a future
+    scan finds the same tuple, every stage whose output is already populated
+    is skipped: stages 2 (metadata + thumbnail), 3 (perceptual hashes), and
+    4b (audio fingerprint) all read straight from this row.
+
+    Cache rows outlive the scans that produced them.  They are pruned by the
+    end-of-scan sweep when their `file_path` falls under the just-scanned root
+    but they were not seen during the scan.
+    """
+
+    __tablename__ = "file_cache"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    file_path = Column(String, nullable=False)
+    file_size = Column(Integer, nullable=False)
+    mtime_ns = Column(Integer, nullable=False)
+
+    # Optional full-file hash (Phase 3 SHA-256 fast path; nullable until computed)
+    sha256_full = Column(String, nullable=True)
+
+    # Cached metadata (stage 2 output)
+    duration = Column(Float, nullable=True)
+    width = Column(Integer, nullable=True)
+    height = Column(Integer, nullable=True)
+    bitrate = Column(Integer, nullable=True)
+    video_codec = Column(String, nullable=True)
+    audio_codec = Column(String, nullable=True)
+    fps = Column(Float, nullable=True)
+    audio_channels = Column(Integer, nullable=True)
+    audio_sample_rate = Column(Integer, nullable=True)
+    sar_num = Column(Integer, default=1)
+    sar_den = Column(Integer, default=1)
+    rotation = Column(Integer, default=0)
+
+    # Cached pipeline outputs (stages 3 and 4b)
+    perceptual_hashes = Column(Text, nullable=True)  # JSON array of hex hashes
+    audio_fp = Column(Text, nullable=True)           # JSON array of 64 floats
+    thumbnail_path = Column(String, nullable=True)
+
+    # Quick-rejection cascade
+    #   head_tail_xxh3 — xxh3_64 hex of first 64 KiB + last 64 KiB.  Byte-
+    #     identical files always share this; used as an O(1) exact-duplicate
+    #     fast path before any decode happens.
+    #   aggregate_hash — 256-bit hex from per-bit majority vote across the
+    #     12 perceptual hashes.  Used by the FAISS binary index as the
+    #     screening key; the 12-hash set is then the verifier.
+    head_tail_xxh3 = Column(String, nullable=True)
+    aggregate_hash = Column(String, nullable=True)
+
+    # Bookkeeping
+    first_seen_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    last_seen_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    cache_version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        UniqueConstraint("file_path", "file_size", "mtime_ns", name="uq_cache_identity"),
+        Index("idx_file_cache_path", "file_path"),
+        Index("idx_file_cache_lastseen", "last_seen_at"),
+    )
 
 
 class DeletionLog(Base):

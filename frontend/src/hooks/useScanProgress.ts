@@ -6,7 +6,7 @@ import type { ScanStatus } from '../types';
 import api from '../services/api';
 
 export function useScanProgress(scanId: number | null) {
-  const { progress: wsProgress, isConnected } = useWebSocket(scanId);
+  const { progress: wsProgress, errors, isConnected, clearErrors } = useWebSocket(scanId);
   const [scanStatus, setScanStatus] = useState<ScanStatus | null>(null);
   const [isComplete, setIsComplete] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -75,6 +75,8 @@ export function useScanProgress(scanId: number | null) {
   return {
     scanStatus,
     wsProgress,
+    errors,
+    clearErrors,
     isConnected,
     isComplete,
     error,

@@ -1,8 +1,8 @@
 # Duplicate Video Detector
 
-![Dashboard](docs/dashboard.png)
-
 A full-stack web application that scans directories, detects duplicate or near-duplicate videos, compares their quality, and helps you clean up lower-quality copies.
+
+Full design and operational docs live under [`docs/`](docs/) — start at [`docs/README.md`](docs/README.md). For Claude Code contributors, [`CLAUDE.md`](CLAUDE.md) is the per-session brief.
 
 ## Architecture
 
@@ -78,29 +78,46 @@ npm run dev -- --port 3000
 
 Open **http://localhost:3000** in your browser.
 
+### Option C: Docker (with NVIDIA GPU)
+
+Multi-stage build packages the React frontend into a CUDA-enabled FastAPI image; the SPA is served from the same port as the API.
+
+```bash
+# Edit docker-compose.yml first to mount your media directory:
+#   - /path/to/your/videos:/media:ro
+
+docker compose up --build
+```
+
+Open **http://localhost:9000** in your browser. Requires Docker + the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) on the host. The SQLite DB and generated thumbnails persist in `./data/` and `./thumbnails/` (both git-ignored).
+
 ## Features
 
 ### Duplicate Detection Pipeline
 
-4-stage progressive filtering:
+Progressive filtering with aggressive caching (full breakdown in [`docs/pipeline.md`](docs/pipeline.md)):
 
-1. **Duration pre-filter** — groups videos by approximate duration (±2s or 5% tolerance)
-2. **Perceptual hashing** — extracts key frames, computes pHash, compares via Hamming distance
-3. **Audio fingerprinting** — RMS energy cross-correlation as fallback for re-encodes
-4. **Quality scoring** — weighted analysis of resolution (40%), bitrate (25%), codec (15%), file size (10%), FPS (10%)
+1. **Cache lookup** — cross-scan `file_cache` keyed by `(file_path, file_size, mtime_ns)` skips any stage whose output is already cached and fresh
+2. **Byte-identical fast path** — files sharing `(size, head+tail blake2b)` are clustered and inherit their representative's hashes, skipping pHash and audio FP entirely
+3. **Duration pre-filter** — groups by ±3s absolute or 5% relative tolerance, whichever is larger
+4. **Perceptual hashing** — 12 key frames per video, letterbox-stripped pHash, Hamming-distance compared (FAISS-prescreened for large duration groups)
+5. **Audio fingerprinting** — 60s middle-of-file RMS profile, cross-correlated as a fallback for re-encodes
+6. **Quality scoring** — weighted analysis of resolution (40%), bitrate (25%), codec (15%), file size (10%), FPS (10%)
 
 ### Scan Queue
 
 - Queue multiple directory scans — they run sequentially, one at a time
 - Real-time progress via WebSocket with pause/resume/stop controls
-- Cancel queued scans before they start
+- Per-file error log streamed live to the dashboard (frame-extract timeouts, ffprobe failures, etc.)
+- Cancel queued scans before they start; delete completed scans from history one-by-one or via **Clear All** (cross-scan file cache is preserved)
+- **Crash-safe**: pipeline outputs commit per-batch, so a killed/restarted server resumes from where it left off — orphaned active scans are auto-flipped to `stopped` on startup
 - GPU-accelerated processing when NVIDIA CUDA is available
 
 ### Duplicate Review
 
 - Side-by-side comparison with full metadata
 - Auto-selects best quality file to keep
-- Status workflow: **Pending** → **In Queue** (after review) → **Resolved**
+- Status workflow: **Pending** → **Resolved** (set after the user confirms a selection or runs auto-clean)
 - Filters persist when navigating between list and comparison views
 
 ### Deletion & Cleanup
@@ -129,20 +146,22 @@ Once the backend is running, visit **http://localhost:9000/docs** for the intera
 │   │   ├── database.py            # SQLAlchemy models & DB setup
 │   │   └── schemas.py             # Pydantic schemas
 │   ├── services/
-│   │   ├── scanner.py             # Video file discovery
+│   │   ├── scanner.py             # Video file discovery + head/tail content hash
 │   │   ├── metadata.py            # FFprobe metadata extraction
-│   │   ├── hasher.py              # Perceptual hashing
+│   │   ├── hasher.py              # Perceptual hashing (CUDA-aware)
 │   │   ├── audio_fingerprint.py   # Audio fingerprint extraction
-│   │   ├── comparator.py          # Duplicate detection pipeline
+│   │   ├── comparator.py          # Duplicate detection pipeline (+ FAISS prescreen)
 │   │   ├── quality_scorer.py      # Quality scoring & ranking
 │   │   ├── file_manager.py        # Deletion & trash operations
 │   │   ├── scan_control.py        # Pause/resume/stop signals
+│   │   ├── error_log.py           # Per-scan in-memory error ring buffer
 │   │   └── gpu_detector.py        # NVIDIA GPU detection
 │   ├── api/
 │   │   ├── scan.py               # Scan endpoints + queue logic
 │   │   ├── duplicates.py         # Duplicate group endpoints
 │   │   ├── actions.py            # Delete/clean/stats/history endpoints
 │   │   └── websocket.py          # WebSocket connection manager
+│   ├── diagnose_pair.py           # CLI: trace duplicate detection for two specific files
 │   └── requirements.txt
 ├── frontend/
 │   ├── src/
@@ -153,6 +172,9 @@ Once the backend is running, visit **http://localhost:9000/docs** for the intera
 │   │   ├── services/api.ts       # API client
 │   │   └── types/index.ts        # TypeScript interfaces
 │   └── vite.config.ts
-├── start.bat                      # Windows one-click launcher
+├── docs/                          # Architecture, API, pipeline, and configuration docs
+├── Dockerfile                     # Multi-stage frontend + CUDA backend build
+├── docker-compose.yml             # Single-service compose with NVIDIA GPU passthrough
+├── start.bat                      # Windows one-click launcher (backend + frontend)
 └── README.md
 ```

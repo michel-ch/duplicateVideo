@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     # Duplicate detection
     DURATION_TOLERANCE_SECONDS: float = 3.0
     HASH_SIMILARITY_THRESHOLD: int = 14  # Hamming distance threshold (higher = more lenient)
-    SIMILARITY_THRESHOLD_PERCENT: float = 85.0
+    SIMILARITY_THRESHOLD_PERCENT: float = 70.0
 
     # Quality scoring weights
     RESOLUTION_WEIGHT: float = 0.40

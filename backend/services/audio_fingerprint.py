@@ -35,15 +35,26 @@ _executor = ThreadPoolExecutor(max_workers=8)
 # Number of energy samples in a fingerprint
 _NUM_POINTS = 64
 
+# Cap on how much audio we decode per file.  Decoding the FULL track for a
+# 2-hour movie wastes ~80-95% of stage 4b time — middle 60s of audio is
+# already plenty for a 64-point RMS profile to discriminate re-encodes.
+# Bump `AUDIO_FP_VERSION` whenever this sampling rule changes so cached
+# fingerprints from the old rule get invalidated automatically.
+_AUDIO_SAMPLE_SECONDS = 60
+AUDIO_FP_VERSION = 2
+
 
 def _audio_fingerprint_sync(
     file_path: str,
     num_points: int = _NUM_POINTS,
+    duration: Optional[float] = None,
 ) -> List[float]:
     """Extract a compact audio energy profile.
 
     Steps:
-      1. Decode the full audio track to 8 kHz mono 16-bit PCM via FFmpeg
+      1. Decode up to `_AUDIO_SAMPLE_SECONDS` of audio (centred in the track
+         when duration is known and long enough) to 8 kHz mono 16-bit PCM
+         via FFmpeg
       2. Split into `num_points` equal-length segments
       3. Compute RMS energy per segment
       4. Normalise to [0, 1]
@@ -51,8 +62,14 @@ def _audio_fingerprint_sync(
     Returns a list of `num_points` floats, or [] on failure.
     """
     try:
-        cmd = [
-            "ffmpeg",
+        cmd = ["ffmpeg"]
+        if duration is not None and duration > _AUDIO_SAMPLE_SECONDS:
+            ss = max(0.0, (duration - _AUDIO_SAMPLE_SECONDS) / 2)
+            cmd += ["-ss", f"{ss:.3f}", "-t", str(_AUDIO_SAMPLE_SECONDS)]
+        else:
+            cmd += ["-t", str(_AUDIO_SAMPLE_SECONDS)]
+
+        cmd += [
             "-i", str(file_path),
             "-vn",
             "-ac", "1",
@@ -64,7 +81,7 @@ def _audio_fingerprint_sync(
         result = subprocess.run(
             cmd,
             capture_output=True,
-            timeout=120,
+            timeout=30,
             creationflags=_CREATION_FLAGS,
         )
 
@@ -123,9 +140,17 @@ def compare_audio_fingerprints(
 
 # ── Async wrappers ────────────────────────────────────────────────────────────
 
-async def audio_fingerprint(file_path: str) -> List[float]:
-    """Async wrapper for audio fingerprint extraction."""
+async def audio_fingerprint(
+    file_path: str,
+    duration: Optional[float] = None,
+) -> List[float]:
+    """Async wrapper for audio fingerprint extraction.
+
+    Pass `duration` (from a prior metadata pass) to centre the sampled
+    window in the track instead of decoding from the start.
+    """
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
-        _executor, _audio_fingerprint_sync, file_path
+        _executor,
+        lambda: _audio_fingerprint_sync(file_path, duration=duration),
     )

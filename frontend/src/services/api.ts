@@ -43,6 +43,14 @@ export const api = {
   cancelScan: (scanId: number) =>
     request<any>(`/scan/${scanId}`, { method: 'DELETE' }),
 
+  // Same endpoint as cancelScan — accepted for queued OR terminal scans;
+  // alias kept for clarity at call sites.
+  deleteScan: (scanId: number) =>
+    request<any>(`/scan/${scanId}`, { method: 'DELETE' }),
+
+  deleteAllScans: () =>
+    request<{ deleted_count: number; message: string }>('/scans', { method: 'DELETE' }),
+
   listScans: () =>
     request<any[]>('/scans'),
 

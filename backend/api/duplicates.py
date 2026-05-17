@@ -162,12 +162,12 @@ async def resolve_duplicate_group(
         else:
             errors.append(f"{video.file_path}: {message}")
 
-    group.status = "in_queue"
+    group.status = "resolved"
     await db.commit()
 
     return {
         "success": len(errors) == 0,
         "deleted": deleted_files,
         "errors": errors,
-        "group_status": "in_queue"
+        "group_status": "resolved"
     }

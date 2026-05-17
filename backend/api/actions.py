@@ -83,7 +83,7 @@ async def auto_clean(request: AutoCleanRequest, db: AsyncSession = Depends(get_d
         result = await db.execute(
             select(DuplicateGroup)
             .options(selectinload(DuplicateGroup.videos))
-            .where(DuplicateGroup.status == "pending")
+            .where(DuplicateGroup.status != "resolved")
         )
         groups = result.scalars().unique().all()
 
@@ -113,7 +113,7 @@ async def auto_clean(request: AutoCleanRequest, db: AsyncSession = Depends(get_d
     result = await db.execute(
         select(DuplicateGroup)
         .options(selectinload(DuplicateGroup.videos))
-        .where(DuplicateGroup.status == "pending")
+        .where(DuplicateGroup.status != "resolved")
     )
     groups = result.scalars().unique().all()
 
@@ -150,7 +150,7 @@ async def auto_clean(request: AutoCleanRequest, db: AsyncSession = Depends(get_d
                 else:
                     errors.append(f"{video.file_path}: {message}")
 
-        group.status = "in_queue"
+        group.status = "resolved"
 
     await db.commit()
 

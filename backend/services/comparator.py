@@ -2,7 +2,10 @@
 
 Stages:
   1. Duration grouping  — cluster videos with similar durations
-  2. Video hash match   — pHash comparison (best-match) within each cluster
+  2. Video hash match   — pHash comparison (best-match) within each cluster.
+                          For large clusters with cached aggregate hashes a
+                          FAISS binary index does an O(n) candidate filter
+                          before the expensive 12-frame verifier runs.
   3. Audio fallback     — if video hashes are inconclusive, compare audio
                           fingerprints to catch re-encodes with different
                           visual formatting (portrait ↔ landscape, SAR, etc.)
@@ -13,9 +16,21 @@ import asyncio
 from typing import List, Dict, Tuple, Optional, Set
 from collections import defaultdict
 
+import numpy as np
+
 from services.hasher import compare_hash_sets
 from services.audio_fingerprint import compare_audio_fingerprints
 from config import settings
+
+try:
+    import faiss  # type: ignore
+    HAS_FAISS = True
+except ImportError:
+    HAS_FAISS = False
+
+# Below this group size, building a FAISS index costs more than the
+# O(n²) it would save.
+_FAISS_MIN_GROUP_SIZE = 16
 
 
 # ── Stage 1: Duration grouping ───────────────────────────────────────────────
@@ -81,6 +96,71 @@ def _file_size_compatible(v1: dict, v2: dict, ratio: float = 20.0) -> bool:
 
 # ── Stage 2 + 3: Hash comparison with audio fallback ─────────────────────────
 
+def _faiss_phash_candidates(
+    videos: List[dict],
+    hash_threshold: int,
+) -> Optional[Set[Tuple[int, int]]]:
+    """Return the set of (i, j) pairs flagged by a FAISS binary range query
+    on the per-video aggregate hash, or None if FAISS isn't usable here.
+
+    The aggregate hash is a per-bit majority vote over the 12 frame pHashes
+    (256 bits when hash_size=16).  Two videos whose aggregates are within
+    `hash_threshold * 1.5` Hamming bits are SHORTLISTED — they still get
+    the full 12×12 best-match verification via `compare_hash_sets`.
+
+    Returns None to mean "use all-pairs", which the caller treats as the
+    pre-FAISS code path.
+    """
+    if not HAS_FAISS or len(videos) < _FAISS_MIN_GROUP_SIZE:
+        return None
+    with_agg = [(idx, v["aggregate_hash"]) for idx, v in enumerate(videos)
+                if v.get("aggregate_hash")]
+    if len(with_agg) < _FAISS_MIN_GROUP_SIZE:
+        return None
+    try:
+        # All aggregate hashes must be the same bit width to share an index.
+        first_bytes = bytes.fromhex(with_agg[0][1])
+        bit_width = len(first_bytes) * 8
+        rows = []
+        idxs = []
+        for idx, agg in with_agg:
+            try:
+                b = bytes.fromhex(agg)
+            except ValueError:
+                continue
+            if len(b) * 8 != bit_width:
+                continue
+            rows.append(np.frombuffer(b, dtype=np.uint8))
+            idxs.append(idx)
+        if len(rows) < _FAISS_MIN_GROUP_SIZE:
+            return None
+        arr = np.stack(rows, axis=0)
+        index = faiss.IndexBinaryFlat(bit_width)
+        index.add(arr)
+        # Inflate the radius a little — the aggregate is a lossy summary of
+        # the 12 frame hashes, so a true match on the 12-frame verifier can
+        # show a slightly larger Hamming distance at the aggregate level.
+        radius = max(1, int(hash_threshold * 1.5))
+        lims, _D, I = index.range_search(arr, radius)
+        candidates: Set[Tuple[int, int]] = set()
+        for local_i in range(len(idxs)):
+            global_i = idxs[local_i]
+            for offset in range(int(lims[local_i]), int(lims[local_i + 1])):
+                local_j = int(I[offset])
+                if local_i == local_j:
+                    continue
+                global_j = idxs[local_j]
+                a, b = (global_i, global_j) if global_i < global_j else (global_j, global_i)
+                candidates.add((a, b))
+        return candidates
+    except Exception as e:
+        # FAISS error → fall back to all-pairs.  Print so a programming
+        # bug (shape mismatch, version skew) doesn't silently regress
+        # large duration buckets to O(n²).
+        print(f"[FAISS] candidate query failed, falling back to all-pairs: {e}")
+        return None
+
+
 def find_duplicates_in_group(
     videos: List[dict],
     hash_threshold: int = 10,
@@ -96,6 +176,10 @@ def find_duplicates_in_group(
          re-encodes with different visual formatting)
 
     Uses Union-Find so transitive duplicates are merged.
+
+    For large duration groups (≥ _FAISS_MIN_GROUP_SIZE) a FAISS binary
+    range_search on the aggregate hash filters the O(n²) pHash pair set
+    down to a shortlist before the expensive 12×12 verifier runs.
     """
     if len(videos) < 2:
         return []
@@ -114,6 +198,12 @@ def find_duplicates_in_group(
         if ra != rb:
             parent[ra] = rb
 
+    phash_candidates = _faiss_phash_candidates(videos, hash_threshold)
+    no_agg_idx: Set[int] = (
+        {idx for idx, v in enumerate(videos) if not v.get("aggregate_hash")}
+        if phash_candidates is not None else set()
+    )
+
     for i in range(n):
         hashes_i = videos[i].get("hashes") or []
         audio_i = videos[i].get("audio_fp") or []
@@ -130,8 +220,16 @@ def find_duplicates_in_group(
             matched = False
             match_method = None
 
-            # Try video hash first
-            if hashes_i and hashes_j:
+            # FAISS-shortlisted pHash compare.  When FAISS is off (small
+            # group / no aggregates / lib missing) phash_candidates is None
+            # and every pair is checked, matching the pre-FAISS behaviour.
+            should_check_phash = (
+                phash_candidates is None
+                or i in no_agg_idx
+                or j in no_agg_idx
+                or (i, j) in phash_candidates
+            )
+            if should_check_phash and hashes_i and hashes_j:
                 is_similar, sim = compare_hash_sets(hashes_i, hashes_j, hash_threshold)
                 if is_similar:
                     similarity = sim

@@ -44,5 +44,10 @@ class ConnectionManager:
         data["type"] = "complete"
         await self.send_progress(scan_id, data)
 
+    async def send_error_log(self, scan_id: int, entry: dict):
+        """Broadcast a single per-scan error log entry to all watchers."""
+        payload = {"type": "error_log", **entry}
+        await self.send_progress(scan_id, payload)
+
 
 manager = ConnectionManager()

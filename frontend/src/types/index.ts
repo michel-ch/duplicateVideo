@@ -114,6 +114,16 @@ export interface ScanProgressMessage {
   gpu_name?: string | null;
 }
 
+export interface ScanErrorLogEntry {
+  type: 'error_log';
+  scan_id: number;
+  stage: string;       // "metadata" | "hashing" | "audio_fp" | "cache_sweep" | "pipeline"
+  level: string;       // "error" | "warning"
+  message: string;
+  file_path: string | null;
+  timestamp: string;   // ISO 8601 UTC
+}
+
 export interface BrowseEntry {
   name: string;
   path: string;
