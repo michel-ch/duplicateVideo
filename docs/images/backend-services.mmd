@@ -1,0 +1,52 @@
+graph TD
+    subgraph routers["api/ — FastAPI routers"]
+        scan_api["scan.py<br/>POST /scan, /scans, /browse<br/>WS /scan/{id}/ws"]
+        dup_api["duplicates.py<br/>GET/POST /duplicates"]
+        action_api["actions.py<br/>/delete /auto-clean /stats<br/>/settings /history"]
+        ws_api["websocket.py<br/>ConnectionManager"]
+    end
+
+    subgraph services["services/ — domain logic"]
+        scanner["scanner.py<br/>discover_videos<br/>compute_head_tail_hash"]
+        metadata["metadata.py<br/>extract_metadata (ffprobe)"]
+        hasher["hasher.py<br/>extract_and_hash<br/>compare_hash_sets<br/>compute_aggregate_hash"]
+        audio_fp["audio_fingerprint.py<br/>audio_fingerprint<br/>compare_audio_fingerprints"]
+        comparator["comparator.py<br/>group_by_duration<br/>find_duplicates_in_group<br/>FAISS prescreen"]
+        quality["quality_scorer.py<br/>rank_group<br/>calculate_wasted_space"]
+        file_mgr["file_manager.py<br/>move_to_trash<br/>delete_permanently<br/>undo_deletion"]
+        scan_ctrl["scan_control.py<br/>pause/resume/stop events"]
+        gpu_det["gpu_detector.py<br/>detect_gpu"]
+        err_log["error_log.py<br/>per-scan ring buffer"]
+    end
+
+    subgraph models["models/"]
+        db["database.py<br/>SQLAlchemy async<br/>init_db, _migrate_add_columns"]
+        schemas["schemas.py<br/>Pydantic"]
+    end
+
+    subgraph external["External subprocesses"]
+        ffmpeg["ffmpeg / ffprobe<br/>+ CUVID, CUDA filters"]
+        sqlite[("SQLite<br/>duplicate_detector.db")]
+    end
+
+    scan_api --> scanner
+    scan_api --> metadata
+    scan_api --> hasher
+    scan_api --> audio_fp
+    scan_api --> comparator
+    scan_api --> quality
+    scan_api --> scan_ctrl
+    scan_api --> err_log
+    scan_api --> ws_api
+    scan_api --> db
+    dup_api --> file_mgr
+    dup_api --> db
+    action_api --> file_mgr
+    action_api --> db
+    metadata --> ffmpeg
+    hasher --> ffmpeg
+    audio_fp --> ffmpeg
+    scanner --> ffmpeg
+    db --> sqlite
+    gpu_det --> ffmpeg
+    scan_api --> gpu_det

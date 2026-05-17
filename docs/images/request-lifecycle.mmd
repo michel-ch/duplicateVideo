@@ -1,0 +1,48 @@
+sequenceDiagram
+    autonumber
+    actor User
+    participant SPA as React SPA<br/>(Dashboard.tsx)
+    participant API as services/api.ts
+    participant Vite as Vite proxy<br/>(:3000 dev only)
+    participant FastAPI as FastAPI<br/>(:9000)
+    participant ScanRouter as api/scan.py
+    participant BG as BackgroundTask<br/>run_scan_pipeline
+    participant Services as services/<br/>scanner / metadata /<br/>hasher / audio_fp / comparator
+    participant FFmpeg as ffmpeg / ffprobe<br/>(subprocess)
+    participant DB as SQLite<br/>(aiosqlite)
+    participant WS as WebSocket<br/>ConnectionManager
+
+    User->>SPA: enter path, click Start Scan
+    SPA->>API: api.startScan(path, options)
+    API->>Vite: POST /api/scan
+    Vite->>FastAPI: forwarded
+    FastAPI->>ScanRouter: route handler
+    ScanRouter->>DB: INSERT ScanJob (status=pending or queued)
+    ScanRouter->>BG: background_tasks.add_task(run_scan_pipeline)
+    ScanRouter-->>API: 200 {id, status, message}
+    API-->>SPA: scanId
+    SPA->>WS: open ws://.../api/scan/{id}/ws
+    WS-->>SPA: replay current state + error_log backlog
+
+    par background pipeline
+        BG->>Services: discover_videos(root)
+        Services->>DB: bulk SELECT FileCache (cache lookup)
+        loop per batch (max_concurrent * 4)
+            BG->>Services: extract_metadata + thumbnail<br/>+ compute_head_tail_hash
+            Services->>FFmpeg: ffprobe / ffmpeg
+            FFmpeg-->>Services: metadata + frame
+            BG->>DB: commit batch (crash safety)
+            BG->>WS: send_progress (throttled ≥0.5%)
+            WS-->>SPA: progress event
+        end
+        BG->>Services: extract_and_hash (pHash)
+        BG->>Services: audio_fingerprint
+        BG->>Services: run_duplicate_pipeline<br/>(duration → FAISS → pHash → audio)
+        BG->>Services: rank_group + calculate_wasted_space
+        BG->>DB: persist DuplicateGroup + scores
+        BG->>DB: DELETE stale FileCache rows under root
+        BG->>WS: send_complete
+        WS-->>SPA: complete event
+    end
+
+    SPA->>SPA: reset() after loadScans + getStats refreshed

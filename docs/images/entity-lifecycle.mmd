@@ -1,0 +1,39 @@
+stateDiagram-v2
+    [*] --> queued: POST /api/scan (another scan active)
+    [*] --> pending: POST /api/scan (no active scan)
+    queued --> pending: prior scan terminal, _start_next_queued()
+    queued --> [*]: DELETE /api/scan/{id}
+
+    pending --> scanning: run_scan_pipeline starts
+    scanning --> metadata: discover_videos done
+    metadata --> hashing: stage 2 done
+    hashing --> comparing: stage 3 done
+
+    scanning --> paused: POST /scan/{id}/pause
+    metadata --> paused: POST /scan/{id}/pause
+    hashing --> paused: POST /scan/{id}/pause
+    comparing --> paused: POST /scan/{id}/pause
+    paused --> scanning: POST /scan/{id}/resume
+
+    comparing --> completed: pipeline ok
+    scanning --> failed: exception
+    metadata --> failed: exception
+    hashing --> failed: exception
+    comparing --> failed: exception
+
+    scanning --> stopped: POST /scan/{id}/stop
+    metadata --> stopped: POST /scan/{id}/stop
+    hashing --> stopped: POST /scan/{id}/stop
+    comparing --> stopped: POST /scan/{id}/stop
+    paused --> stopped: POST /scan/{id}/stop
+
+    pending --> stopped: server restart (_recover_orphaned_scans)
+    scanning --> stopped: server restart
+    metadata --> stopped: server restart
+    hashing --> stopped: server restart
+    comparing --> stopped: server restart
+    paused --> stopped: server restart
+
+    completed --> [*]: DELETE /api/scan/{id}
+    failed --> [*]: DELETE /api/scan/{id}
+    stopped --> [*]: DELETE /api/scan/{id}

@@ -1,0 +1,108 @@
+erDiagram
+    scan_jobs ||--o{ video_files : "scans"
+    scan_jobs ||--o{ duplicate_groups : "produces"
+    duplicate_groups ||--o{ video_files : "groups"
+    file_cache ||--o{ video_files : "cache_hit_for"
+    scan_jobs ||--o{ deletion_logs : "scan_job_id"
+    duplicate_groups ||--o{ deletion_logs : "duplicate_group_id"
+
+    scan_jobs {
+        int id PK
+        string root_path
+        string status "queued|pending|scanning|metadata|hashing|comparing|paused|completed|failed|stopped"
+        int total_files
+        int scanned_files
+        string current_file
+        string current_stage
+        float progress_percent
+        int duplicate_groups_found
+        float recoverable_space
+        datetime started_at
+        datetime completed_at
+        text error_message
+        text options "JSON"
+    }
+
+    video_files {
+        int id PK
+        int scan_job_id FK
+        int duplicate_group_id FK
+        int file_cache_id FK
+        string file_path
+        string file_name
+        float file_size
+        datetime created_at
+        datetime modified_at
+        float duration
+        int width
+        int height
+        int bitrate
+        string video_codec
+        string audio_codec
+        float fps
+        int audio_channels
+        int audio_sample_rate
+        text perceptual_hashes "JSON array"
+        bool hash_computed
+        float quality_score
+        bool is_best_quality
+        string thumbnail_path
+        bool is_deleted
+        datetime deleted_at
+        string trash_path
+        bool cache_hit
+        UNIQUE uq_scan_file_path "scan_job_id,file_path"
+    }
+
+    duplicate_groups {
+        int id PK
+        int scan_job_id FK
+        float similarity_score
+        float total_wasted_space
+        int file_count
+        string status "pending|in_queue|resolved"
+        int best_file_id
+        datetime created_at
+    }
+
+    file_cache {
+        int id PK
+        string file_path
+        int file_size
+        int mtime_ns
+        string sha256_full
+        float duration
+        int width
+        int height
+        int bitrate
+        string video_codec
+        string audio_codec
+        float fps
+        int audio_channels
+        int audio_sample_rate
+        int sar_num
+        int sar_den
+        int rotation
+        text perceptual_hashes "JSON"
+        text audio_fp "JSON 64 floats"
+        string thumbnail_path
+        string head_tail_xxh3
+        string aggregate_hash "256-bit"
+        datetime first_seen_at
+        datetime last_seen_at
+        int cache_version
+        UNIQUE uq_cache_identity "file_path,file_size,mtime_ns"
+    }
+
+    deletion_logs {
+        int id PK
+        string original_path
+        string trash_path
+        float file_size
+        string deletion_mode "trash|permanent"
+        datetime deleted_at
+        bool is_undone
+        datetime undone_at
+        int scan_job_id
+        int duplicate_group_id
+    }

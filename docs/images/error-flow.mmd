@@ -1,0 +1,31 @@
+flowchart TD
+    Req[Frontend api.ts request] --> Fetch[fetch /api/...]
+    Fetch -->|network down| NetErr[TypeError: Failed to fetch]
+    Fetch -->|response.ok| OK[response.json] --> Caller
+    Fetch -->|response.ok=false| Parse[response.json catch fallback to detail=statusText]
+    Parse --> ThrowDetail[throw Error: detail or HTTP-N]
+    NetErr --> CatchPoll{caller is a poll loop?}
+    ThrowDetail --> CatchPoll
+    CatchPoll -->|yes — loadScans / getStats / getGpuStatus| Swallow[console.error, keep last list]
+    CatchPoll -->|no — handleStartScan / handleResolve / handlePause / etc.| ShowInline[setError state, render inline ⚠️ banner]
+
+    subgraph Backend["Backend response shape"]
+        HTTPException["fastapi HTTPException(status_code=N, detail='...')"] --> Envelope["body: {detail: '...'}"]
+    end
+
+    HTTP400["400 Bad Request<br/>e.g. invalid directory,<br/>delete active scan"] --> Envelope
+    HTTP403["403 Forbidden<br/>e.g. /browse denied"] --> Envelope
+    HTTP404["404 Not Found<br/>e.g. scan_id missing"] --> Envelope
+    HTTP500["500 Internal Server Error<br/>e.g. file_manager raise"] --> Envelope
+    Envelope --> Parse
+
+    subgraph PipelineErrs["Scan pipeline (background) errors"]
+        PerFile[per-file failure:<br/>ffprobe / hash / audio_fp]
+        PerFile --> ErrLog[error_log.log + manager.send_error_log]
+        ErrLog --> ErrWS[WebSocket type=error_log]
+        ErrWS --> ErrPanel[Dashboard ⚠️ Scan Errors panel<br/>capped at 200, kept across scan end]
+        Fatal[fatal pipeline exception] --> ScanFail[ScanJob.status=failed,<br/>error_message persisted]
+        Fatal --> ErrLog
+        ScanFail --> WSComplete[WebSocket type=error]
+        WSComplete --> ErrPanel
+    end

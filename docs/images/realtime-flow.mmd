@@ -1,0 +1,39 @@
+sequenceDiagram
+    autonumber
+    participant SPA as React SPA<br/>useWebSocket
+    participant WS as FastAPI WebSocket<br/>/api/scan/{id}/ws
+    participant CM as ConnectionManager
+    participant ErrLog as services/error_log.py
+    participant Pipeline as run_scan_pipeline<br/>(background)
+    participant ScanCtrl as services/scan_control.py
+
+    SPA->>WS: open ws://.../api/scan/{id}/ws
+    WS->>CM: connect(socket, scan_id)
+    WS-->>SPA: initial {type:"progress"|"complete", scan_state}
+    WS->>ErrLog: get_recent(scan_id)
+    WS-->>SPA: replay each error_log entry
+
+    loop pipeline runs
+        Pipeline->>ScanCtrl: check_signals (between batches)
+        ScanCtrl-->>Pipeline: stop? / paused?
+        Pipeline->>CM: send_progress({progress_percent, stage, ...})<br/>throttled ≥0.5% advance
+        CM-->>SPA: type=progress
+        SPA->>SPA: dispatch by type<br/>progress → setProgress<br/>error_log → push to errors[]<br/>pong → ignore
+
+        opt per-file failure
+            Pipeline->>ErrLog: log(stage, message, file_path)
+            Pipeline->>CM: send_error_log(entry)
+            CM-->>SPA: type=error_log
+            SPA->>SPA: errors.push(entry) capped 200
+        end
+    end
+
+    Pipeline->>CM: send_complete({status, duplicate_groups_found, ...})
+    CM-->>SPA: type=complete
+    SPA->>SPA: isComplete=true → loadScans + getStats → reset()
+
+    Note over SPA,WS: keep-alive every ~30s<br/>SPA sends "ping", server replies type=pong
+
+    SPA->>WS: socket close (or network drop)
+    WS->>CM: disconnect(socket, scan_id)
+    SPA->>SPA: useWebSocket reconnects after 2s<br/>if scan still non-terminal

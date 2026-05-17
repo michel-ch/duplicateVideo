@@ -1,0 +1,21 @@
+flowchart TD
+    Start([Open app at :3000 or :9000]) --> Dashboard["/ — Dashboard<br/>stats, scan list, GPU badge"]
+    Dashboard -->|enter path + Start Scan| StartScan[POST /api/scan]
+    StartScan -->|active scan exists| Queued[status=queued]
+    StartScan -->|no active scan| Active[status=pending → scanning]
+    Queued -->|prior scan finishes| Active
+    Active -->|WebSocket /scan/id/ws| Progress[ProgressTracker live updates<br/>pause / resume / stop]
+    Progress --> Done{terminal status?}
+    Done -->|completed| RecentScans[Recent Scans row → Review →]
+    Done -->|failed / stopped| RecentScans
+    RecentScans --> DupList["/duplicates — DuplicatesList<br/>paginated, sortable, filterable"]
+    DupList -->|click a group| Compare["/duplicates/:groupId — ComparisonView<br/>auto-select best, toggle keep/delete"]
+    Compare -->|Confirm Selection| Resolve[POST /duplicates/id/resolve]
+    Compare -->|Keep Best, Delete Rest| Resolve
+    DupList -->|Auto-Clean| AutoClean[POST /auto-clean]
+    AutoClean --> Resolve
+    Resolve --> History["/history — restore from trash or clear log"]
+    Dashboard -.->|sidebar| DupList
+    Dashboard -.->|sidebar| Queue["/queue — DeletionQueue"]
+    Dashboard -.->|sidebar| History
+    Dashboard -.->|sidebar| Settings["/settings — thresholds, weights"]

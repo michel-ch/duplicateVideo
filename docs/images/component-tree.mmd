@@ -1,0 +1,39 @@
+graph TD
+    App["App.tsx<br/>BrowserRouter + sidebar"]
+
+    subgraph dashboard["Dashboard.tsx — / (data-fetching)"]
+        D_FB["FolderBrowser<br/>GET /api/browse"]
+        D_PT["ProgressTracker<br/>(consumes useScanProgress)"]
+        D_USP["useScanProgress hook"]
+        D_UWS["useWebSocket hook<br/>WS /api/scan/id/ws"]
+        D_USP --> D_UWS
+        D_PT --> D_USP
+    end
+
+    subgraph compare["ComparisonView.tsx — /duplicates/:groupId (data-fetching)"]
+        C_VC["VideoCard (pure)<br/>thumbnail + selection state"]
+        C_MT["MetadataTable (pure)<br/>key/value rows"]
+        C_QB["QualityBadge (pure)<br/>Best label"]
+        C_CM["ConfirmationModal (pure)"]
+    end
+
+    subgraph duplist["DuplicatesList.tsx — /duplicates (data-fetching)"]
+        L_VC["VideoCard (pure)"]
+        L_QB["QualityBadge (pure)"]
+    end
+
+    App --> dashboard
+    App --> compare
+    App --> duplist
+    App --> Queue["DeletionQueue.tsx — /queue"]
+    App --> History["History.tsx — /history"]
+    App --> Settings["Settings.tsx — /settings"]
+
+    dashboard --> D_FB
+    dashboard --> D_PT
+    compare --> C_VC
+    compare --> C_MT
+    compare --> C_QB
+    compare --> C_CM
+    duplist --> L_VC
+    duplist --> L_QB

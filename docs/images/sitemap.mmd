@@ -1,0 +1,24 @@
+graph TD
+    Root["/<br/>Dashboard<br/>scan launcher, live progress,<br/>queue, recent scans,<br/>error panel, GPU badge"]
+    Dup["/duplicates<br/>DuplicatesList<br/>paginated, filterable,<br/>sort by wasted_space / similarity"]
+    Cmp["/duplicates/:groupId<br/>ComparisonView<br/>side-by-side review,<br/>auto-select best"]
+    Q["/queue<br/>DeletionQueue<br/>batch delete pending groups"]
+    H["/history<br/>History<br/>deletion log, undo, clear"]
+    S["/settings<br/>Settings<br/>thresholds, weights,<br/>extensions, protected paths"]
+
+    Root ==>|sidebar nav| Dup
+    Root ==>|sidebar nav| Q
+    Root ==>|sidebar nav| H
+    Root ==>|sidebar nav| S
+    Root -->|completed-scan Review →| Dup
+    Dup -->|click a group row| Cmp
+    Cmp -->|Resolve / Back →| Dup
+    Q -->|Process selection| H
+    Cmp -.->|after delete| H
+
+    style Root fill:#a5d8ff,stroke:#2563eb
+    style Cmp fill:#d0bfff,stroke:#8b5cf6
+    style Dup fill:#b2f2bb,stroke:#22c55e
+    style Q fill:#ffd8a8,stroke:#f59e0b
+    style H fill:#fff3bf,stroke:#f59e0b
+    style S fill:#c3fae8,stroke:#06b6d4

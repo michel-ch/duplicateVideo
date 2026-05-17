@@ -1,0 +1,14 @@
+graph LR
+    subgraph App["FastAPI process — uvicorn :9000"]
+        SQLA["SQLAlchemy 2.0 async"] --> AIO["aiosqlite driver"]
+    end
+    AIO -->|file I/O| DB[("backend/duplicate_detector.db<br/>SQLite WAL")]
+    DB --> Tables["5 tables + 3 indices"]
+    Tables -.->|cross-scan layer| Cache["file_cache<br/>UNIQUE file_path file_size mtime_ns<br/>pHashes audio_fp<br/>head_tail_xxh3 aggregate_hash"]
+    App -->|stage 2 extract_thumbnail| Thumbs["backend/thumbnails/*.jpg<br/>served at /thumbnails"]
+    subgraph Docker["Docker compose volumes — optional"]
+        Vol1["./data : /app/backend/data"]
+        Vol2["./thumbnails : /app/backend/thumbnails"]
+    end
+    Vol1 -.->|bind mount| DB
+    Vol2 -.->|bind mount| Thumbs

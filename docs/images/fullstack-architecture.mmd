@@ -1,0 +1,48 @@
+graph TD
+    User(["User<br/>browser"])
+
+    subgraph Dev["Dev mode (two processes)"]
+        Vite["Vite dev server :3000<br/>HMR<br/>proxy /api + /thumbnails → :9000<br/>(ws: true)"]
+    end
+
+    subgraph Prod["Prod mode (single process)"]
+        Static["FastAPI StaticFiles<br/>+ serve_frontend_fallback<br/>(SPA history fallback)"]
+    end
+
+    subgraph FastAPI["FastAPI uvicorn :9000"]
+        APIRoutes["/api/scan /scans /browse<br/>/api/duplicates<br/>/api/delete /auto-clean<br/>/api/stats /settings /history<br/>/api/gpu-status"]
+        WSRoute["WS /api/scan/{id}/ws<br/>ConnectionManager fan-out"]
+        BG["BackgroundTask<br/>run_scan_pipeline<br/>(one at a time)"]
+    end
+
+    subgraph Services["Services + subprocesses"]
+        Pipe["scanner / metadata /<br/>hasher / audio_fp /<br/>comparator / quality_scorer /<br/>file_manager / scan_control /<br/>error_log / gpu_detector"]
+        FFmpeg["ffmpeg / ffprobe<br/>(+ CUVID, CUDA filters)"]
+        GPU["NVIDIA GPU<br/>(optional)"]
+    end
+
+    subgraph Data["Persistence"]
+        SQLite[("SQLite<br/>duplicate_detector.db<br/>(includes file_cache)")]
+        Thumbs["thumbnails/*.jpg"]
+        Trash["<scan_root>/.duplicate_trash/<br/>(per-scan-root, on user filesystem)"]
+    end
+
+    User -->|http| Vite
+    User -->|http| Static
+    Vite -->|REST| APIRoutes
+    Vite -->|WebSocket upgrade| WSRoute
+    Static -->|REST| APIRoutes
+    Static -->|WebSocket upgrade| WSRoute
+    APIRoutes --> BG
+    APIRoutes --> Pipe
+    BG --> Pipe
+    BG --> WSRoute
+    Pipe --> FFmpeg
+    FFmpeg -.->|hw accel| GPU
+    Pipe --> SQLite
+    Pipe --> Thumbs
+    Pipe --> Trash
+    WSRoute -->|JSON frames<br/>progress / error_log /<br/>complete / pong| User
+
+    classDef boundary stroke-dasharray: 4 4
+    class Dev,Prod boundary

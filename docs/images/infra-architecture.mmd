@@ -1,0 +1,35 @@
+graph TD
+    subgraph Host["Docker host"]
+        Compose["docker-compose.yml<br/>service: duplicate-video"]
+        subgraph Container["Container: duplicate-video-detector"]
+            CudaBase["nvidia/cuda:12.2.2-runtime-ubuntu22.04"]
+            Python["python3.11 + uvicorn :9000"]
+            FFmpegC["ffmpeg / ffprobe<br/>(NVIDIA-built)"]
+            Dist["frontend/dist/<br/>(copied from node:20-alpine build stage)"]
+            Cwd["WORKDIR /app/backend<br/>DATABASE_URL=sqlite+aiosqlite:///./data/...<br/>NVIDIA_VISIBLE_DEVICES=all<br/>NVIDIA_DRIVER_CAPABILITIES=all"]
+        end
+        Compose --> Container
+    end
+
+    subgraph BuildStage["Dockerfile stage 1 (build only)"]
+        Node["node:20-alpine<br/>npm ci → npm run build"]
+    end
+    Node -.->|COPY --from=frontend-build| Dist
+
+    subgraph Volumes["Host bind mounts"]
+        DataVol["./data → /app/backend/data<br/>(SQLite DB)"]
+        ThumbVol["./thumbnails → /app/backend/thumbnails<br/>(generated JPEGs)"]
+        MediaVol["/path/to/your/videos → /media:ro<br/>(commented sample — uncomment to scan)"]
+    end
+    DataVol --> Container
+    ThumbVol --> Container
+    MediaVol -.->|optional| Container
+
+    subgraph GPU["NVIDIA GPU passthrough"]
+        Runtime["runtime: nvidia<br/>+ deploy.resources.reservations.devices"]
+        Devs["/dev/nvidia0, nvidiactl,<br/>nvidia-modeset, nvidia-uvm,<br/>nvidia-uvm-tools"]
+    end
+    Runtime --> Container
+    Devs --> Container
+
+    Container -->|EXPOSE 9000<br/>ports: 9000:9000| Browser(["Browser<br/>http://host:9000"])

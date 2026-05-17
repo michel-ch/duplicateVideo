@@ -1,0 +1,24 @@
+graph TD
+    Client["React SPA<br/>(browser)"] -->|HTTP /api/* + WS| Uvicorn
+
+    subgraph Backend["FastAPI process — uvicorn :9000"]
+        Uvicorn["uvicorn + lifespan<br/>init_db, _recover_orphaned_scans,<br/>detect_gpu"]
+        Uvicorn --> CORS["CORS middleware<br/>+ _QuietPollFilter"]
+        CORS --> Routers["api/ routers<br/>scan.py, duplicates.py,<br/>actions.py"]
+        Routers --> Pipeline["BackgroundTask<br/>run_scan_pipeline<br/>(one at a time)"]
+        Routers --> Services["services/ — domain logic"]
+        Pipeline --> Services
+        Pipeline --> WS["websocket.py<br/>ConnectionManager<br/>per-scan WS fan-out"]
+        Pipeline --> ErrLog["error_log<br/>200-entry ring buffer"]
+        Pipeline --> ScanCtrl["scan_control<br/>asyncio.Event registry"]
+        Services --> Hash["hasher / audio_fp /<br/>comparator / quality_scorer"]
+        Services --> ORM["SQLAlchemy ORM<br/>+ Pydantic schemas"]
+    end
+
+    Services -->|subprocess| FFmpeg["ffmpeg / ffprobe<br/>(+ CUVID, CUDA filters)"]
+    ORM --> SQLite[("SQLite<br/>duplicate_detector.db")]
+    WS -->|JSON frames| Client
+    FFmpeg -->|GPU| GPU["NVIDIA GPU<br/>(optional)"]
+
+    Routers -->|StaticFiles| Thumbs["/thumbnails/*.jpg"]
+    Routers -->|StaticFiles + SPA fallback| Dist["frontend/dist/<br/>(prod build)"]

@@ -6,11 +6,110 @@ A full-stack web application that scans directories, detects duplicate or near-d
 
 Full design and operational docs live under [`docs/`](docs/) — start at [`docs/README.md`](docs/README.md). For Claude Code contributors, [`CLAUDE.md`](CLAUDE.md) is the per-session brief.
 
-## Architecture
+## Documentation
 
-- **Backend**: Python + FastAPI + SQLAlchemy (SQLite) + FFmpeg
-- **Frontend**: React + TypeScript + Vite
-- **Real-time**: WebSocket for live scan progress
+### Stack
+
+| Layer          | Technology                                                          |
+|----------------|---------------------------------------------------------------------|
+| Database       | SQLite 3 (via `aiosqlite` async driver, WAL journaling)             |
+| ORM            | SQLAlchemy 2.0 async + Pydantic v2 schemas                          |
+| Backend        | Python 3.10+, FastAPI 0.104, uvicorn `[standard]`                   |
+| Frontend       | React 19, Vite 7, React Router 7, TypeScript (strict)               |
+| Real-time      | FastAPI native WebSocket (`/api/scan/{id}/ws`)                      |
+| Auth           | None — single-user local app                                        |
+| Media tooling  | FFmpeg + FFprobe (CUVID decoders + CUDA filters when GPU present)   |
+| Similarity     | `imagehash` pHash · `numpy`/`scipy` RMS audio FP · `faiss-cpu` prescreen |
+| Infra          | Docker multi-stage (`node:20-alpine` + `nvidia/cuda:12.2.2-runtime`), docker-compose |
+
+### Database schema
+
+Five tables managed by SQLAlchemy 2.0 async. `scan_jobs` owns the per-scan `video_files` and `duplicate_groups` (cascade on delete); `file_cache` is the cross-scan layer keyed by `(file_path, file_size, mtime_ns)` that lets unchanged files skip the expensive metadata / pHash / audio-FP stages on re-scans. `deletion_logs` is an append-only audit trail with undo via `trash_path`.
+
+![Database schema](./docs/images/db-schema.png)
+
+### Architecture overview
+
+A two-process design in development (Vite :3000 → FastAPI :9000 proxy), a single-process design in production (FastAPI serves the built SPA from `frontend/dist`). All non-trivial work happens inside one uvicorn process — at most one scan runs at a time; additional scans queue. The frontend speaks `/api/*` over REST + `WS /api/scan/{id}/ws` for real-time progress and per-file error streaming.
+
+![Full-stack architecture](./docs/images/fullstack-architecture.png)
+
+### Database architecture
+
+The database is a single SQLite file inside the FastAPI process — no separate server, no connection pool tuning, no read replica. In Docker, `./data` and `./thumbnails` are bind-mounted to survive container restarts. The cross-scan `file_cache` table lives inside the same DB; `cache_version` columns gate per-output freshness so format changes don't poison results.
+
+![Database architecture](./docs/images/db-architecture.png)
+
+### Main entity lifecycle
+
+`ScanJob.status` is the central state machine. New scans enter `queued` if another scan is active, otherwise `pending → scanning → metadata → hashing → comparing → completed`. Pause/stop are honoured at every batch boundary by `services/scan_control.py`. On a hard process kill, `_recover_orphaned_scans()` in `main.py` flips any orphaned active state to `stopped` so the queue isn't permanently blocked.
+
+![Entity lifecycle](./docs/images/entity-lifecycle.png)
+
+### Backend services
+
+Layers may only call **down**: `api/` → `services/` → `models/`. Services never import from `api`. The single exception is `api/scan.py:run_scan_pipeline`, which orchestrates the whole pipeline. FFmpeg / FFprobe are subprocesses bounded by an `asyncio.Semaphore` (12 with GPU, 8 CPU-only).
+
+![Backend services](./docs/images/backend-services.png)
+
+### API overview
+
+| Method | Route                                | Description                                                          | Auth |
+|--------|--------------------------------------|----------------------------------------------------------------------|------|
+| POST   | `/api/scan`                          | Start a new scan (queues if another is active)                       | no   |
+| GET    | `/api/scan/{id}/status`              | Current status for one scan                                          | no   |
+| POST   | `/api/scan/{id}/pause`               | Pause a running scan                                                 | no   |
+| POST   | `/api/scan/{id}/resume`              | Resume a paused scan                                                 | no   |
+| POST   | `/api/scan/{id}/stop`                | Stop a running or paused scan                                        | no   |
+| DELETE | `/api/scan/{id}`                     | Cancel a queued scan **or** delete a terminal scan from history      | no   |
+| DELETE | `/api/scans`                         | Wipe every non-active scan in one shot (keeps `file_cache`)          | no   |
+| GET    | `/api/scans`                         | List every scan (most recent first)                                  | no   |
+| GET    | `/api/browse`                        | Filesystem directory picker (drives on Windows, `/` on Unix)         | no   |
+| WS     | `/api/scan/{id}/ws`                  | Real-time progress + per-file error stream + ping/pong               | no   |
+| GET    | `/api/duplicates`                    | Paginated, sortable, filterable list of duplicate groups             | no   |
+| GET    | `/api/duplicates/{id}`               | One duplicate group with every video                                 | no   |
+| POST   | `/api/duplicates/{id}/resolve`       | Mark a group resolved, delete the chosen file ids                    | no   |
+| POST   | `/api/delete`                        | Delete a list of `video_files.id`s (trash or permanent)              | no   |
+| POST   | `/api/auto-clean`                    | Auto-delete every lower-quality duplicate (with confirm preview)     | no   |
+| GET    | `/api/stats`                         | Dashboard counters (videos, groups, recoverable space, …)            | no   |
+| GET    | `/api/settings`                      | Current thresholds, weights, extensions, protected paths             | no   |
+| PUT    | `/api/settings`                      | Update settings (in-memory; persist via `.env` / `config.py`)        | no   |
+| GET    | `/api/history`                       | Paginated deletion log                                               | no   |
+| POST   | `/api/history/{id}/undo`             | Restore a trashed file (rejects permanent / already-undone)          | no   |
+| DELETE | `/api/history`                       | Clear every deletion log entry                                       | no   |
+| GET    | `/api/gpu-status`                    | Cached GPU probe (name, VRAM, CUVID decoders, CUDA filters)          | no   |
+
+### Frontend structure
+
+SPA with sidebar layout (`App.tsx`). Six pages map 1:1 to user workflow: **Dashboard** (scan launcher + live progress + error panel) → **DuplicatesList** (filter/sort groups) → **ComparisonView** (side-by-side review, auto-selects best) → **DeletionQueue** → **History** → **Settings**. Three pages do all the network work; the rest of the components are pure renderers.
+
+![Sitemap](./docs/images/sitemap.png)
+
+![Component tree](./docs/images/component-tree.png)
+
+### Request lifecycle
+
+The most-used call is `POST /api/scan`: handler inserts a `ScanJob` row and schedules `run_scan_pipeline` as a `BackgroundTask`, then the SPA immediately opens the WebSocket so it sees the initial state and replayed `error_log` backlog. The background pipeline emits throttled (`≥0.5%`) progress updates plus per-file `error_log` events, and commits per-batch so a hard kill loses at most one batch of work.
+
+![Request lifecycle](./docs/images/request-lifecycle.png)
+
+### Key architectural decisions
+
+1. **Cross-scan `file_cache` keyed on `(file_path, file_size, mtime_ns)`** — same identity rsync/git use. Trades one SQL row per video for skipping the entire pipeline on unchanged re-scans; on a clean cache run, the second scan of the same library is dominated by `stat()` calls.
+2. **Batched pipeline with `_pipeline_check()` between batches** — a single `gather()` over all files would be efficient but uninterruptible; batching gives O(batch_size × per-file-time) pause latency, which stays responsive even on 100k-file scans.
+3. **WebSocket throttling at ≥0.5% progress advance** — `BATCH = max_concurrent * 4 ≈ 48` files per batch is ~0.4% of a 12k-file scan, so every batch-end emission survives but redundant values are suppressed.
+4. **SQLite auto-migration via `_migrate_add_columns()` for nullable column adds only** — covers `file_cache.head_tail_xxh3` and `file_cache.aggregate_hash` retro-add. Heavier changes (renames, constraints, new indices) still require deleting the DB; acceptable because the data is fully regenerable.
+5. **FAISS binary prescreen for duration groups of ≥16 with cached `aggregate_hash`** — turns O(n²) 12×12 pHash compares into an O(n) `range_search` over a 256-bit aggregate, verified by the existing pHash comparator. Falls back to all-pairs when FAISS is missing or the group is small.
+6. **Byte-identical fast-path on `(file_size, head_tail_xxh3)`** — representatives do the expensive pHash + audio-FP work; followers inherit the outputs. Preserves transitive matching across re-encodes (a follower can still link to a transcode via the shared rep).
+7. **Cache versioning (`PHASH_VERSION`, `AUDIO_FP_VERSION`)** — extraction format changes don't poison stale cache rows; rows below the current version are silently re-extracted while writers always `max(cache_version, X)` so the version is monotonically increasing.
+8. **Per-batch `db.commit()` + `_recover_orphaned_scans()` on startup** — a hard kill (Ctrl-C, OOM, power loss) loses at most one batch; orphaned `ScanJob` rows flip to `stopped` so the queue isn't permanently blocked.
+
+### What is not yet documented
+
+- **CI/CD** — no `.github/workflows/`, `.gitlab-ci.yml`, or other pipeline config detected. To document a pipeline, add the config file and re-run the autodoc workflow; the deployment diagram already covers the runtime side.
+- **Authentication flow** — intentionally absent (single-user local app). If you expose the service beyond localhost, reverse-proxy auth (basic auth at nginx / Caddy) is the documented workaround in [`docs/deployment.md`](docs/deployment.md).
+- **Cache flowchart (read/write paths)** — there is no separate cache layer (Redis/Memcached) to diagram; the `file_cache` table is covered by the ER diagram and the request-lifecycle sequence above.
+- **CDN / load balancer / API gateway** — the production layout is single-process (one uvicorn behind a reverse proxy at most). If you front it with a CDN or LB, extend the full-stack architecture diagram with those nodes.
 
 ## Prerequisites
 
