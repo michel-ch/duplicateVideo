@@ -1,5 +1,7 @@
 # Duplicate Video Detector
 
+![Dashboard](docs/dashboard.png)
+
 A full-stack web application that scans directories, detects duplicate or near-duplicate videos, compares their quality, and helps you clean up lower-quality copies.
 
 Full design and operational docs live under [`docs/`](docs/) — start at [`docs/README.md`](docs/README.md). For Claude Code contributors, [`CLAUDE.md`](CLAUDE.md) is the per-session brief.

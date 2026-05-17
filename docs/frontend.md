@@ -48,7 +48,7 @@ Every component is a function component. No class components. All state is in `u
 
 The sidebar uses `<NavLink>` with `({ isActive })` callback styling for the current page.
 
-When the backend is serving the SPA in production, the FastAPI catch-all route returns `index.html` for any unknown path (see [`backend/main.py`](../backend/main.py) lines 82–88), so hard refreshing on `/duplicates/42` works.
+When the backend is serving the SPA in production, the FastAPI catch-all route returns `index.html` for any unknown path (see `serve_frontend_fallback` in [`backend/main.py`](../backend/main.py)), so hard refreshing on `/duplicates/42` works.
 
 ## Real-time scan progress
 

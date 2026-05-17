@@ -22,7 +22,7 @@ A two-process design: a Python/FastAPI backend that owns all I/O and computation
                                                      │  │  hasher / audio_fp /   │  │
                                                      │  │  comparator / quality/ │  │
                                                      │  │  file_manager / gpu /  │  │
-                                                     │  │  scan_control          │  │
+                                                     │  │  scan_control / errlog │  │
                                                      │  └──┬───────────┬─────────┘  │
                                                      │     │           │            │
                                                      │  ┌──▼─────┐  ┌──▼────────┐   │
@@ -50,6 +50,7 @@ A two-process design: a Python/FastAPI backend that owns all I/O and computation
 │    scanner    metadata    hasher            │
 │    audio_fp   comparator  quality_scorer    │
 │    file_mgr   gpu_detect  scan_control      │
+│    error_log                                │
 ├─────────────────────────────────────────────┤
 │  models/      — SQLAlchemy ORM + Pydantic   │
 │    database.py        schemas.py            │
@@ -79,8 +80,8 @@ Layers may only call **down**: `api` → `services` → `models`. Services never
     ─ Stage 3   extract_and_hash        │  Each stage:
     ─ Stage 4a  duration pre-grouping   │   - batches of size max_concurrent*4
     ─ Stage 4b  audio_fingerprint       │   - _pipeline_check between batches
-    ─ Stage 5   run_duplicate_pipeline  │   - WS progress updates throttled to ≥2%
-    ─ Stage 6   rank_group + persist    ┘
+    ─ Stage 5   run_duplicate_pipeline  │   - WS progress updates throttled to ≥0.5%
+    ─ Stage 6   rank_group + persist    ┘   - per-batch db.commit for crash safety
     ─ Stage 7   sweep stale cache rows under root
     ─ scan_control.unregister(scan_id)
     ─ _start_next_queued()
@@ -93,7 +94,7 @@ Layers may only call **down**: `api` → `services` → `models`. Services never
 
 ## Frontend
 
-Single-page React 19 app. Vite dev server proxies `/api` and `/thumbnails` to the backend so dev and prod use identical URLs. In production, the Python backend serves `frontend/dist` itself with an SPA fallback for client-side routes (see `main.py` lines 71–88).
+Single-page React 19 app. Vite dev server proxies `/api` and `/thumbnails` to the backend so dev and prod use identical URLs. In production, the Python backend serves `frontend/dist` itself with an SPA fallback for client-side routes (see the `serve_frontend_fallback` catch-all in `main.py`).
 
 Components are intentionally vanilla — no global state library. State lives in:
 - React Router URL params (which group is being compared, etc.)
@@ -102,9 +103,11 @@ Components are intentionally vanilla — no global state library. State lives in
 
 ## Persistence
 
-SQLite via `sqlalchemy[asyncio]` + `aiosqlite`. The DB file lives at `backend/duplicate_detector.db` in dev. There are no migrations — the schema is materialised by `Base.metadata.create_all()` on startup. **Schema changes require deleting the DB.** This is acceptable because the data is regenerable by re-scanning.
+SQLite via `sqlalchemy[asyncio]` + `aiosqlite`. The DB file lives at `backend/duplicate_detector.db` in dev. The schema is materialised by `Base.metadata.create_all()` on startup, followed by `_migrate_add_columns()` — an idempotent loop that uses `PRAGMA table_info` + `ALTER TABLE … ADD COLUMN` to add new nullable columns to existing tables (currently `file_cache.head_tail_xxh3` and `file_cache.aggregate_hash`). **Any other schema change** — renamed columns, type changes, new constraints, new indices — still requires deleting the DB. This is acceptable because the data is regenerable by re-scanning.
 
-The DB holds five tables: `scan_jobs`, `video_files` (per-scan records), `duplicate_groups`, `deletion_logs`, and `file_cache` (Phase 1 — cross-scan cache of pipeline outputs keyed by `(file_path, file_size, mtime_ns)`). See [database.md](database.md).
+`main.py:_recover_orphaned_scans()` also runs in the FastAPI lifespan: any `ScanJob` row stuck in an active status from a crashed prior process is flipped to `stopped` so the queue isn't permanently blocked.
+
+The DB holds five tables: `scan_jobs`, `video_files` (per-scan records), `duplicate_groups`, `deletion_logs`, and `file_cache` (cross-scan cache of pipeline outputs keyed by `(file_path, file_size, mtime_ns)`). See [database.md](database.md).
 
 ## Static files
 

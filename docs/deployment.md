@@ -20,7 +20,7 @@ pip install -r requirements.txt
 python -m uvicorn main:app --host 0.0.0.0 --port 9000
 ```
 
-Open http://localhost:9000 — the same port serves API, thumbnails, and the SPA. Hard-refresh on `/duplicates/42` works because of the SPA fallback in [`backend/main.py`](../backend/main.py) lines 82–88.
+Open http://localhost:9000 — the same port serves API, thumbnails, and the SPA. Hard-refresh on `/duplicates/42` works because of the `serve_frontend_fallback` catch-all in [`backend/main.py`](../backend/main.py).
 
 For production: drop `--reload`, run behind a reverse proxy (see below), and use a process manager (systemd, NSSM, supervisord).
 
@@ -83,7 +83,7 @@ server {
 }
 ```
 
-The `proxy_read_timeout` of 600s is important — a default 60s read timeout will silently drop idle WS connections, and the frontend will keep reconnecting. The throttled progress messages (≥ 2% increments) can occasionally be more than 60s apart on huge scans.
+The `proxy_read_timeout` of 600s is important — a default 60s read timeout will silently drop idle WS connections, and the frontend will keep reconnecting. The throttled progress messages (≥ 0.5% increments) can occasionally be more than 60s apart on huge scans of small files where individual batches don't shift the percentage much.
 
 ## Persistence
 
@@ -107,16 +107,17 @@ The application has the ability to delete files anywhere on the filesystem the p
 
 ## Logs
 
-uvicorn logs to stdout. The `_QuietPollFilter` in `main.py` drops `/api/stats` and `/api/gpu-status` lines (Dashboard polls them every 3s). Other logs include:
+uvicorn logs to stdout. The `_QuietPollFilter` in `main.py` drops `/api/stats` and `/api/gpu-status` lines (Dashboard polls them every 1.5s). Other logs include:
 
 - `[STARTUP] GPU acceleration enabled — <name>` (or CPU-only message)
+- `[STARTUP] Recovered N orphaned scan(s) → stopped` (when the previous process crashed mid-scan — see crash-recovery section of [database.md](database.md))
 - `[GPU] GPU: ... | Driver: ... | VRAM: ...` (one-time summary)
 - `Audio FP error: <path>: <error>` per-file failures
 - `Error processing video: <error>` from metadata stage
 - `[GPU/CPU] Frame extraction error for <path>: <error>`
 - `[GPU/CPU] Thumbnail extraction error: <error>`
 
-Per-file errors don't abort the scan — they're logged and the scan continues with whatever videos succeeded.
+Per-file errors don't abort the scan — they're logged AND streamed to connected clients as `error_log` WebSocket messages (see [api.md](api.md)) so the dashboard's error panel surfaces them in real time.
 
 ## Updating
 
